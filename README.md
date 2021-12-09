@@ -4,6 +4,6 @@ The repo contains code for paper Rearrangement Processes and Structural Variatio
 Analyses include :
 
 1. Rearrangement signature (RS) regression with molecular features 
-2. Mutational signatures and patient clustering 
+2. Mutational signatures and patient clustering (WIP)
 
 
