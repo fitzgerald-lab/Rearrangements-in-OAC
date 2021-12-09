@@ -1,0 +1,222 @@
+---
+title: "Rearrangement signatures regression "
+author: "Alvin"
+date: "08/12/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(MASS)
+library(caret)
+```
+
+## Regression analysis to associate rearrangement signatures (RS) to molecular features
+
+This document contains the code to run a logistic regression using the presence of the RS (RS*.bin) in each tumour and features include : 
+- RS Signature weights, log-scaled 
+- Number of Me events, log-scaled
+- SNV.subtypes from Secrier 2016
+- Number of complex SV clusters, log-scaled
+- Number of chromothripsis events
+- Chemotherapy status of specimen
+- ecDNA amplicons affecting driver genes, 1/0
+- Number of mutations assigned to SNV signatures, log-scaled 
+- Number of breakage-fusion-bridge cycle events, log-scaled
+- Number of ecDNA events, log-scaled
+
+```{r, functions}
+## function for logistic regression
+log.reg <- function(response, reg) {
+  bin.res <- paste0(response, '.bin')
+  univariate <- lapply(colnames(reg)[!grepl(paste('Id', response, bin.res, '.bin', 'RS.', sep = '|'), colnames(reg))], function(x){
+    
+    suppressMessages(
+      fit <- glm( as.formula(paste0(paste(bin.res, '~', sep=' '), x)), data = reg, family = 'binomial', maxit = 1000)
+    )
+    coef <- summary(fit)$coefficient
+    
+    ## univariate fdr adjusted p < 0.05
+    if ((coef[2,4] < 0.05) ){ 
+      coef <- coef[2,, drop=F]
+      coef
+    } else {
+      coef <-  NULL }
+  }
+  )
+  
+  uni<- do.call(rbind,compact(univariate))
+  uni<- cbind(uni, p.adjust(uni[,4], 'fdr'))
+  
+  if (nrow(uni) > 0){ 
+    
+    ## multivariate fdr adjusted p < 0.05
+    coef <- rownames(uni)[ uni[,5] < 0.05]
+    coef <- coef[!is.na(coef)]
+  } else coef <- c()
+  
+  if (length(coef) > 0 ){ 
+    form <- as.formula(paste( c(paste(bin.res, '~', sep=' '), gsub('DDR|Mutagenic', '', coef)), collapse = '+'))
+    out.model <- glm(form, data = reg, family = 'binomial', maxit = 1000)
+    out.model <- stepAIC(out.model, reg )
+  }
+}
+
+## function to create partitions for each RS, 10 replicates each
+part.list <- function(x, percent, reg) {
+  
+  index <- createDataPartition(reg[,x], p = percent,times =  10)
+  
+  lapply(index, function(y){
+    
+    train.set <- reg %>% dplyr::slice(y)
+    test.set <- reg %>% dplyr::filter(!Id %in% train.set$Id)
+    
+    list(train = train.set, 
+         test = test.set )
+  })
+}
+
+## generate logistic regression model
+generate.model <- function(sv, partition) {
+  lapply(partition, function(y){
+    log.reg(sv, y[['train']])
+  })
+}
+
+
+## m is model 
+generate.tables <- function(m){ 
+  
+  resample.names <- names(m)
+  
+  out <- bind_rows(lapply(resample.names, function(n){ 
+    
+    df <- m[[n]]
+    
+    if (!is.null(df)){ 
+      
+      output <- cbind(  as.data.frame(coefficients(summary(df)))[,1:4],
+                        exp(coef(df)), exp(confint(df)))
+      
+      output %>%  rownames_to_column('Variable') %>% mutate(index = n )
+    }
+  }))
+  out %>% filter(`Pr(>|z|)` < 0.05 & Variable !='(Intercept)')
+}
+
+
+```
+
+## Regression model run on all samples in the paper 
+```{r, full.model}
+reg.data <- readRDS('rds/regression.input.rds')
+## SV signatures to run
+svs <- colnames(reg.data)[grepl('RS.*\\d$', colnames(reg.data))]
+
+## Run the regression 
+final.model <- lapply(svs, function(x) log.reg(x, reg.data))
+
+## Generate final summary tablmes
+final.tables <- lapply(final.model, function(x){ 
+  
+  if (!is.null(x)){ 
+
+  output <- cbind(  as.data.frame(coefficients(summary(x)))[,1:4],
+                     exp(coef(x)), exp(confint(x)))
+
+    output
+    
+    }
+})
+
+names(final.tables) <- svs
+
+## output table and filter by fdr-adjusted p-values
+comb.table <- do.call(rbind, final.tables) %>% rownames_to_column('Variable') %>% 
+  arrange(desc(`exp(coef(x))`)) %>%  
+  mutate(padj = p.adjust(`Pr(>|z|)`, 'fdr')) %>% 
+  filter(padj < 0.1 & !grepl('Intercept', Variable))
+
+## Supp table output 
+comb.table %>% filter(`exp(coef(x))` > 1.5 | `exp(coef(x))` < 0.5 )
+```
+
+## Regression using RNAseq expression of driver genes 
+Expression data from RNAs is input as TPM without scaling 
+```{r, expression}
+exp.reg <- readRDS('rds/regression.expression.input.rds')
+exp.model <- lapply(svs, function(x) log.reg(x, exp.reg))
+
+exp.tables <- lapply(exp.model, function(x){ 
+  
+  if (!is.null(x)){ 
+
+  output <- cbind(  as.data.frame(coefficients(summary(x)))[,1:4],
+                     exp(coef(x)), exp(confint(x)))
+
+    output
+    
+    }
+})
+
+names(exp.tables) <- svs
+exp.comb.tables <- do.call(rbind, exp.tables) %>% rownames_to_column('Variable') %>%  
+  filter(!grepl('Intercept', Variable)) %>%
+  mutate(padj = p.adjust(`Pr(>|z|)`, 'fdr')) %>%  
+  filter(padj < 0.1 ) %>% 
+  arrange(desc(`exp(coef(x))`))
+
+## expression output in supp table
+exp.comb.tables %>% filter(`exp(coef(x))` > 1.5 | `exp(coef(x))`< 0.5)
+```
+
+## Generate subsets of cohort to determine robustness of associated features
+Generate partitions of 80-20, 60-40, 40-60 and test how many times each feature is significant in 10 replicates per partition. 
+
+```{r, partitions}
+## generate sample partitions for 80, 60, 40 
+parts <- c(1, .8, .6, .4)
+partitions <- lapply(setNames(parts, nm = parts), function(p) {
+  partition <- lapply(svs, function(s) part.list(s, p, reg.data %>% dplyr::select(-Chemo_status)))
+  names(partition) <- svs
+  partition
+    }
+  ) 
+
+## run regression for each partition, replicate and summarize freq per variable 
+out <- lapply(setNames(names(partitions), nm = names(partitions)), function(x){
+  sv.names <- names(partitions[[x]])
+  output <- lapply(setNames(sv.names, nm = sv.names), function(sv){ 
+     generate.tables(generate.model(sv, partitions[[x]][[sv]])) %>% 
+      group_by(Variable) %>% 
+      dplyr::summarise("counts.{x}" := n()/10) 
+    
+    })
+  
+  output
+  
+})
+
+## summarize output and from each partition and compare output per signature
+out.summary <- lapply(setNames(svs, nm = svs), function(x) {
+  df  <- list(out[['1']][[x]], out[['0.8']][[x]], out[['0.6']][[x]], out[['0.4']][[x]]) %>% 
+    reduce(full_join, by = "Variable")
+   df %>% arrange(counts.1) 
+  }
+)
+
+## output, 1 df per RS
+out.summary
+
+```
+
+
+
+
+
+
+
+
+
